@@ -1,0 +1,157 @@
+#!/bin/bash
+# Robs ioblast canary script...  run from cron every 1 or 5 minutes
+# sends telemetry to graphite.  rob@vastdata.com Mon Feb 22 15:25:18 PST 2021
+
+#
+# the arg passed to this script is the directory to go test. that needs to exist 
+# and have a writeable ioblast subdir
+# to match the example below: mkdir /prj/se200/project1/ioblast 
+#
+#  Add this as a cron  (change the mountpoint, which is the last arg)
+# */5 * * * * [ -x /pkg/trmb/bin/ioblast ] && /pkg/trmb/bin/ioblast_canary /prj/se200/project1 >/dev/null 2>&1
+
+# Note that if the cron is setup, if an admin touches a file DO_NOT_IOBLAST,  then this script will skip tests.
+
+
+HOST=`uname -n | cut -d. -f1`
+installdir=`cd \`dirname $0\`; pwd`
+PATH=/bin:/usr/bin:/usr/sbin:/pkg/trmb/bin
+export PATH
+
+IOBLAST=/pkg/trmb/bin/ioblast
+
+## change the above paths to ioblast script,
+## and change the below to match your GRAPHITE_HOST
+####  Graphite
+GRAPHITE_HOST=10.100.12.183
+GRAPHITE_PORT=2003
+
+EPOCH_TIME=`date +%s`
+VERBOSE=true
+graphite_send()
+{
+    if [ ! -z "$VERBOSE"  ]; then
+        echo "Sending : $1"
+    fi
+
+    echo $1 $EPOCH_TIME | /pkg/trmb/bin/nc -w1 $GRAPHITE_HOST $GRAPHITE_PORT
+    echo /pkg/trmb/bin/nc -w1 $1 $EPOCH_TIME $GRAPHITE_HOST $GRAPHITE_PORT
+}
+
+
+if [ $# -lt 1 ]
+then echo "${0}:  you must supply a path to ioblast."
+   exit
+fi
+
+
+## TARGET is the view/share/mountpoint to test, are the same, and within that we need an ioblast directory
+TARGET=$1
+SCRATCHDIR=$TARGET
+[[ -n "`echo $SCRATCHDIR | grep -v /nas/`" ]] && SCRATCHNAME=`basename $SCRATCHDIR`
+
+## Check for a writeable ioblast subdir (you can chown/chgrp this to our cron user)
+[[ -w $TARGET/ioblast ]] || echo "NO WRITEABLE $TARGET/ioblast  ... exiting"
+[[ -w $TARGET/ioblast ]] || exit
+
+
+#
+# LOCKFILE   we don't want to run this more than once at a time..
+#    later we use /pkg/trmb/bin/timelimit to kill lmstat -a if longer than 40 seconds.
+LOCKFILE=/tmp/ioblast_${TLA}.lock
+
+printf "Checking for lockfile..  "
+if [ -f $LOCKFILE ]
+then
+   set -x
+   PID=`/bin/cat $LOCKFILE`
+   RUNNING="`pgrep -P ${PID} | tail -1`"
+   RUNNINGLOG=/tmp/ioblast.${PID}.log
+set +x
+   echo "$LOCKFILE FOUND... checking for process: $PID."
+    # a more advanced version of this script would look for other stuck ioblast canaries,
+    # kill them, or do other smart things depending on which way you want to go.
+   exit
+else echo $$ > $LOCKFILE
+fi
+
+
+function hhmydf
+{
+   set -x
+   /bin/df ${1+"$@"}| cat | while read a FILER SIZE USED d e f g; do
+   [ $a = "Filesystem" ] && continue
+   FILER=${a%:*}
+   #printf "%-30s %8s %8s %8s %8s %s %s\n" $a $b $c $d $e $f $g
+   echo "$FILER   fil $SIZE  siz  $USED usd"
+done
+set +x
+}
+
+function DF
+{
+    # The -P/--portability option is required to get the POSIX output.
+    # Otherwise, df(1) on SUSE 10 will wrap lines to line up columns. This
+    # option is not available on Solaris.
+
+ if [ "$( uname -s )" = Linux ]; then
+        extra=P
+    else
+        extra=
+    fi
+
+#### If we are at THELIMIT of fullness, then alert
+THELIMIT=95
+        THEMOUNT=${1+"$@"}
+        ITSFULL=false
+        typeset a b c d e f g
+        /bin/df -k$extra ${THEMOUNT}/. | grep -v Filesystem |sed -e :a -e '$!N; s/\n/ /; ta'  | \
+        while read a b c d e f g  ; do
+                e=${e%%%}
+                printf "%-30s %8s %8s %4s" $a $b $c $e
+                if [ $e -gt "${THELIMIT%%%}" ] ; then ITSFULL=true ; fi
+                FULLFILER=$(echo $a | cut -d: -f1 )
+        done
+
+
+   if [ "$ITSFULL" = "true" ]
+        then
+               echo "FILER at $THEMOUNT  is over $THELIMIT percent full... Edit this script to notify ADMINS"
+               #echo "FILER at $THEMOUNT  is over $THELIMIT percent full..." | mailx -s "ioblast full: $THEMOUNT " $ADMINS
+               exit
+   fi
+}
+
+
+##  One more extra test,   lets check tcp retransmissions from the client 
+##  and save that also into graphite... sometimes clients are on lossy networks
+##  and that could be a root-cause of performance issues. (correlate to your switch discards)
+## 
+RETRANG=$(cat /proc/net/snmp | grep -A1 Segs  | tail -1  | awk '{print $(NF-2)}')
+NOW=$SECONDS
+
+cd  $SCRATCHDIR/ioblast && test ! -f DO_NOT_IOBLAST && read FILER SIZE USED PERCENT <<< $(DF $SCRATCHDIR)
+
+## for graphite, w change dots to underscores
+FILER=$(echo $FILER| tr '.'  '_' | tr -d ':' | tr -d '/')
+
+############ Now actually run ioblast in the ioblast subdir of $SCRATCHDIR
+for i in 0 1 2 3 4 5 6 7 8 9; do rm -rf $SCRATCHDIR/ioblast/$i ; done
+
+cd  $SCRATCHDIR/ioblast >/dev/null 2>&1 && test ! -f DO_NOT_IOBLAST && echo "Starting $SCRATCHDIR with $PERCENT %full at $SECONDS" && RESULT=`$IOBLAST 2>&1 | grep real | awk '{print $NF}'`
+
+# Remove our lockfile
+rm $LOCKFILE
+
+## Get final counter for retrans...  
+RETRANG=$(( `cat /proc/net/snmp | grep -A1 Segs  | tail -1  | awk '{print $(NF-2)}'` - $RETRANG))
+
+
+# Yes you can change this up to telegraf or logstash or whatever.
+graphite_send "canary.filer.${FILER}.client.${HOST}.ioblast ${RESULT}"
+graphite_send "canary.filer.${FILER}.client.${HOST}.percentused ${PERCENT}"
+sleep .2
+graphite_send "canary.filer.${FILER}.client.${HOST}.retrans $RETRANG"
+graphite_send "canary.filer.${FILER}.client.${HOST}.size $SIZE"
+sleep .2
+graphite_send "canary.filer.${FILER}.client.${HOST}.used $USED"

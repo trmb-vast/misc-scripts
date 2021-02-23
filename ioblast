@@ -1,0 +1,81 @@
+#!/bin/bash
+#  ioblast -- a script originally written by rob mallory around 1994 or 1995
+#  phk/beer-ware license
+#  I used to keep historical stats in this script, when disks and nfs was in minutes. 
+#  this script was written long before iozone had the -t thread flag...in the iozone 1.x days
+#  somehow this can simulate real-world performance better than other synthetics, 
+#  with the best benefit of not being so impactful that you can run it every 5m
+#  
+#  in the code below, there is iozone_nosync, this is patched iozone to not include fsync.
+#  sles had a bug/feature for years where fsync time would be proportional to RAM size, 
+#  even though it was not dependent on how much file data was in buffercache. 
+#  so running on 512GB ram machines would take twice as long as 256GB ram. 
+#  removing fsync from iozone avoided this, yet still made the benchmark able to 
+#  detect filer saturation...  users would complain when ioblast took > 60 seconds.
+#  admins and interactive performance would notice at > 20 seconds. 
+#  These days, Idle is 2 seconds, and really good is < 5 seconds and good is < 10 seconds.
+#  slower than that and you see job efficiency (cpu/runtime) impact. 
+# 
+#  Run this script from cron with a wrapper (ioblast_canary) and then drive the filer into
+#  saturation with normal user workload.  try to correlate how many jobs it took to do this.
+#
+#  rob@vastdata.com Mon Feb 22 15:57:18 PST 2021
+
+
+installdir=`cd \`dirname $0\`; pwd`
+PATH=$installdir:$PATH:$installdir/missing
+TRMB=$installdir
+
+quiet=false
+while getopts q2h c
+do
+       case "$c" in
+              q)  quiet=true;; 
+       esac
+done
+
+if [ "$quiet" = "true" ]
+then :
+else
+
+echo "  ~rmallory/bin/ioblast -- this script forks off 10 iozone autos"
+echo "          it shows the last one and times it also..."
+echo 
+echo
+fi
+
+rm -f /tmp/ioblast  >/dev/null 2>&1
+
+test -x  /tmp/ioblast || (
+cat > /tmp/ioblast << DONE
+#$TRMB/iozone -i 6 -g 4m -a -S8192 1> /dev/null &
+#$TRMB/iozone_nosync -i 0 -g 4m -a -S8192 1> /dev/null &
+$TRMB/iozone -i 0 -g 4m -a -S8192 1> /dev/null &
+DONE
+)
+    TIME="time -p"
+    #IOZONE="$TRMB/iozone -i 6 -g 4m -a -S8192"
+    #IOZONE="$TRMB/iozone_nosync -e -i 0 -g 4m -a -S8192"
+    IOZONE="$TRMB/iozone -e -i 0 -g 4m -a -S8192"
+
+
+chmod a+rx /tmp/ioblast >/dev/null 2>&1
+#WTF do i need to sleep for, once in a while /tmp/ioblast is not found.
+sync ; sleep 1
+
+#Start off 9 iozones in the background.
+for i in 1 2 3 4 5 6 7 8 9
+do (test -d $i || mkdir $i ; cd $i ; /tmp/ioblast ) 
+done
+
+#Start the last iozone 5 seconds later and show the output
+test -d 0 || mkdir 0
+cd 0
+#sleep 5  # no more sleep 5... start this one at same the time.
+#/usr/bin/time $TRMB/iozone1 auto
+# haha.. blast from the past above..
+# call sync here since we remove sync() from iozone.
+sync; sync 
+$TIME $IOZONE 2>&1
+
+echo "Done with ioblast... TOTAL SECONDS:  $(($SECONDS))"
