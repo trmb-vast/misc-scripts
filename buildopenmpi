@@ -1,0 +1,83 @@
+#!/bin/bash
+## buildopenmpi -- a script to build openmpi and install in /pkg/benchtools
+## we actually also build hdf5 and IOR... and install them to the same PREFIX.
+## this is the most sane way to maintain various openmpi + ior versions.
+## notice the flags: --enable-mpirun-prefix-by-default --enable-orterun-prefix-by-default
+## those flags compile the orted searchpath into the originally called openmpirun
+## rob@vastdata.com 
+
+# Last time checked for newer openmpi stable version: 1/3/2021 ..  rmallory
+
+# contact rob for turbo_vast if you want to see compiles to go 3x faster
+#sudo /pkg/trmb/bin/turbo_vast
+#cd /mnt/turbo/loop_selab-cb4-c1.185267   ## cd to the output of the script above
+
+OPENMPI="https://download.open-mpi.org/release/open-mpi/v4.1/openmpi-4.1.2.tar.gz"
+OPENMPI_SHORT=$(echo ${OPENMPI} | awk -F/ '{print $NF}')
+OPENMPI_VERSION=$(echo ${OPENMPI_SHORT} | sed -e 's/.tar.gz//g')
+
+
+PREFIX=/pkg/benchtools/MPI/$OPENMPI_VERSION
+
+# The following is important if someone messed with this variable.
+unset LD_LIBRARY_PATH
+
+## mainline hwloc conflicts with some RHEL8.4 dependencies at this time.
+##  use the distro-supplied version.
+#wget https://download.open-mpi.org/release/hwloc/v2.5/hwloc-2.5.0.tar.gz
+#tar xzvf hwloc-2.5.0.tar.gz
+#cd hwloc-2.5.0
+#./configure --prefix=${PREFIX} 
+#gmake -j 64
+#gmake install
+#cd ..
+
+test -x ${PREFIX}/bin/mpicc && echo "Found an existing ${PREFIX}/bin/mpicc ... do you want me to skip build of openmpi and just do the rest?" && read SKIP
+if [ $(echo $SKIP | cut -c1 | tr 'Y' 'y') = "y" ]
+then  echo "OK.. skipping openmpi build.."
+else
+echo "Info:  Downloading and building $OPENMPI_VERSION"
+wget $OPENMPI
+tar xf $OPENMPI_SHORT
+cd $OPENMPI_VERSION
+./configure --prefix=${PREFIX} --enable-mpirun-prefix-by-default --enable-orterun-prefix-by-default --disable-java --without-pmi
+gmake -j 86
+make install
+cd ..
+fi
+
+# For some strange reason the official hdf5 tgz is not packaged right.. cantg just tar xzvf it.
+# first have to gzip -d it, then tar xf 
+#cp /pkg/trmb/src/hdf5-1.12.1.tar.gz ./
+
+echo "Info:  Downloading and building hdf5-1.12.1"
+wget https://support.hdfgroup.org/ftp/HDF5/releases/hdf5-1.12/hdf5-1.12.1/src/hdf5-1.12.1.tar.gz
+gzip -d hdf5-1.12.1.tar.gz
+tar xvf hdf5-1.12.1.tar
+cd hdf5-1.12.1
+ls -rlt
+./configure --prefix=${PREFIX} --enable-mpirun-prefix-by-default --enable-orterun-prefix-by-default --disable-java --without-pmi
+PATH=${PREFIX}/bin:$PATH
+export PATH
+echo "Info:  this is the mpicc which is picked up from your PATH:"
+which mpicc    #verify you have the right stuff..
+echo "Info:  But we will explicitly set CC=${PREFIX}/bin/mpicc"
+CC=${PREFIX}/bin/mpicc ./configure --enable-parallel --prefix=${PREFIX}
+gmake -j 64
+make install
+cd ..
+
+echo "Info:  downloading and building IOR-3.3.0 --with-HDF5"
+wget https://github.com/hpc/ior/releases/download/3.3.0/ior-3.3.0.tar.bz2
+tar xvf ior-3.3.0.tar.bz2
+cd ior-3.3.0
+CC=${PREFIX}/bin/mpicc ./configure --with-hdf5 --prefix=${PREFIX}
+gmake -j 22
+gmake install
+
+echo "Info: Here is the LDD of the IOR we just compiled.. it should have our new hdf5 lib in there too."
+set -x
+ldd ${PREFIX}/bin/ior  # look for hdf5 library
+set +x
+#history > building_this.txt   # so you have a history for reference.. 
+
