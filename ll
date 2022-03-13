@@ -10,12 +10,13 @@
 #   where the stat of the directory will block until any outstanding client writes to files in that dir are finished.
 #   sometimes this is extremly anoying and can be 30 seconds to a minute. the FIX is:
 #   Simply stat(2)ing those files from a different NFS mount (we append -int for interactive) will return immediate results.
-#
+#   You MUST make a second automount map entry (with -int at the end) and mount it to a different VAST VIP.
 #  you can probably extend this script to also bring benefit to things like rsync, find, etc, which can operate on a
 #  read-only mount.. just change it up and let me know your new usecases.
 # rob@vastdata.com 10/20/2020
 #
-# bugs:  can't currently handle multiple args. can hang if there are nfs hung mounts
+# bugs:  can't currently handle multiple args. 
+#        df can hang if there are nfs hung mounts on the client.
 
 HERE=$(pwd)
 
