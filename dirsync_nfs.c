@@ -1,3 +1,11 @@
+/*    dirsync_nfs.c   -- a c-program which will create/lock/unlock/remove a file in a directory
+                         this will effectively flush the inode-cache for that directory only.
+                         it allows the next stat of a file to be directly from the NFS server.
+                         Very useful for trigger or controll files to coordinate multiple concurrent jobs in a cluster.
+                         it prevents the otherwise necessary need to have an abusively low actimeo/acdirmax/acregmax mount options.
+     This example file was found on the net more than 15 years ago, original author not credited only because I can't find them.
+     the same technique works in python, perl, tcl, and even Bash with flock !
+*/
 #include <stdio.h>
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -60,7 +68,6 @@ int main(int argc, char *argv[])
 
 int lock_unlock(int fd, char *path)
 {
-
   struct flock flockbuf;
   int status;
 
