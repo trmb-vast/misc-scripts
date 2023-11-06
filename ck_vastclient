@@ -1,0 +1,695 @@
+#!/bin/bash
+
+# ck_vastclient  -- a script to audit various client network things, output it, and and save to syslog (splunk)
+#            logstach/elasticsearch or grafana/loki is also an awesome tool to make correlations with
+#            output from this script
+# written 99.5% by human hands. only 0.5% from chatgpt (the awk histogram script)
+# rob.mallory@vastdata.com Thu May 27 00:07:54 UTC 2021
+# Wed Apr 26 20:35:05 UTC 2023 updated formatting
+
+VERSION=20230608
+#LOGSTASH="10.61.140.86 5000"
+GRAFANA=""
+
+PATH=/usr/bin:/usr/sbin:$PATH
+
+usage() {
+	echo "Usage: $0 [ -g group/tag ] [ -w ]"
+	echo ""
+	echo "  -k group/tag     : set a syslog group tag or keyword so you can search for this batch in splunk"
+	echo "  -g group/tag     : set a syslog group tag or keyword so you can search for this batch in splunk"
+	echo "  -w               : enter into remediation mode... and/or do destructive tests"
+	echo ""
+	echo "For optimal NFSoRDMA experience, you should enable PFC with TrustL3/DSCP on a client at TC3, run this:"
+	cat <<EOF
+
+#https://community.mellanox.com/s/article/lossless-roce-configuration-for-linux-drivers-in-dscp-based-qos-mode
+
+
+sudo mlnx_qos -i enp94s0f1 --trust dscp
+sudo bash -c "echo 106 > /sys/class/infiniband/mlx5_1/tc/1/traffic_class"
+sudo cma_roce_tos -d mlx5_1 -t 106
+
+# You can chose the mlnx_qos way above, or Using LLDP DCBX, and configuration in the switch
+sudo mlnx_qos -i enp94s0f1 --pfc 0,0,0,1,0,0,0,0
+mlxconfig -d /dev/mst/mt4115_pciconf0 -y s LLDP_NB_DCBX_P1=TRUE LLDP_NB_TX_MODE_P1=2 LLDP_NB_RX_MODE_P1=2 LLDP_NB_DCBX_P2=TRUE LLDP_NB_TX_MODE_P2=2 LLDP_NB_RX_MODE_P2=2 
+
+
+############
+for switches
+https://community.mellanox.com/s/article/lossless-roce-configuration-for-mlnx-os-switches-in-dscp-based-qos-mode
+
+show interface ethernet counters roce
+# above will only work after you put the switch into "roce enable"  mode
+
+## Modern OnyxOS uses the simple "roce enable" setting above; the below settings 
+## can be used to tune specific ports or QOS. 
+
+##Note - For a fair sharing of switch buffer with other traffic classes, 
+##it is recommended to configure ECN on all other traffic classes.
+
+interface ethernet 1/1-1/32 traffic-class 3 congestion-control ecn minimum-absolute 150 maximum-absolute 1500
+
+### Setup the traffic pool for RoCE
+traffic pool roce type lossless
+traffic pool roce memory percent 50.00
+traffic pool roce map switch-priority 3
+
+###Set a strict priority to CNPs over traffic class 6
+
+interface ethernet 1/1-1/32 traffic-class 6 dcb ets strict
+
+###Set trust mode L3 (DSCP).
+
+interface ethernet 1/1-1/32 qos trust L3
+
+
+### if you want to setup for individual ports, and not use DCBX, and not roce enable, 
+### for example for a client with DSCP pfc  and ecn set on its host port:
+switch-896cc6 [seclients1: master] # sh run | include 1/12
+   interface ethernet 1/12 dcb priority-flow-control mode on force
+   interface ethernet 1/12 qos trust L3
+   interface ethernet 1/12 traffic-class 3 congestion-control ecn minimum-absolute 150 maximum-absolute 1500
+
+EOF
+
+}
+
+# Always reset colour on exit
+trap '{ echo -n "$NORMAL"; }' EXIT
+
+if [ -t 1 ] && [ -t 2 ]; then
+	RED=$(tput setaf 1)
+	GREEN=$(tput setaf 2)
+	YELLOW=$(tput setaf 3) # Yellow
+	BLUE=$(tput setaf 4)   # Blue
+	PURPLE=$(tput setaf 5) # Purple
+	LBLUE=$(tput setaf 6)  # Light Blue
+	BOLD=$(tput bold)      # Bold
+
+	NORMAL=$(tput sgr0)
+else
+	unset GREEN RED NORMAL BLUE PURPLE LBLUE BOLD
+fi
+
+###
+if [ -f /etc/os-release ]; then
+	. /etc/os-release
+	EL_MAJOR="${VERSION_ID%%.*}"
+fi
+# Report and record test fail
+fail() {
+	echo "${RED}[FAIL]${NORMAL} $1"
+	RESULT=1
+}
+
+# Report test pass
+pass() {
+	echo "${GREEN}[PASS]${NORMAL} $1"
+}
+
+# Report warning, but don't fail
+warn() {
+	echo "${YELLOW}${BOLD}[WARN]${NORMAL} $1"
+}
+
+# Report warning, but don't fail
+info() {
+	echo "${LBLUE}[INFO]${NORMAL} $1"
+}
+
+HAVE_SUDO=false
+sudo -l >/dev/null 2>&1 && HAVE_SUDO=true
+
+########### This can be a standalone shell script also
+mountstats_short() {
+	if [ $# -gt 0 ]; then
+		MOUNT=$1
+	else
+		MOUNT='fstype nfs'
+	fi
+
+	$HAVE_SUDO || warn "Need sudo to check detailed mountstats"
+	$HAVE_SUDO || return
+	$HAVE_SUDO && warn "Checking mountstats with sudo"
+
+	$HAVE_SUDO && (echo 1 | sudo tee /sys/module/sunrpc/parameters/expose_id_in_mountstats >/dev/null 2>&1)
+	cat /proc/self/mountstats | grep -E 'fstype nfs|sunrpc-id' >/tmp/mountstats.$$
+
+	DONE=false
+	for ID in $(grep -A1 "${MOUNT}" /tmp/mountstats.$$ | grep sunrpc | awk '{print $NF}'); do
+		if [ "$EXTENDED" = "true" ] || [ "$VERBOSE" = "true" ]; then
+			echo "########################################################################"
+			grep -P -B1 "sunrpc-id:\t${ID}$" /tmp/mountstats.$$ | head -n 1
+			$HAVE_SUDO && sudo cat /sys/kernel/debug/sunrpc/rpc_clnt/${ID}/stats
+		else
+			$DONE || warn "Not showing mountstats.. need the -x or -v flag"
+			DONE=true
+		fi
+	done
+
+	rm /tmp/mountstats.$$
+
+	if [ "$EXTENDED" = "true" ] || [ "$VERBOSE" = "true" ]; then
+		info "_______________________________________"
+		info "Tail -20 of mount command printed below"
+		mount | tail -20
+	fi
+
+}
+
+if [ -n "$(mount | grep 'proto=rdma')" ]; then
+	RDMA_MOUNTS_FOUND=true
+else
+	RDMA_MOUNTS_FOUND=false
+fi
+
+# Error: $1: $2 is $3. Should be $4 [or $5]
+error_is_should() {
+	if [ -z "$5" ]; then
+		fail "Interface $1: $2 is $3. Should be $4."
+	else
+		fail "Interface $1: $2 is $3. Should be $4 or $5."
+	fi
+}
+
+# For interface $1, tag $2, if $3 != $4 and $3 != $5 then generate an error message
+# $5 is optional.
+check_is_should() {
+	if [ -z "$3" ]; then
+		fail "Interface $1: $2 was not found"
+	elif [ "$3" = "$4" -o "$3" = "$5" ]; then
+		pass "Interface $1: $2 has expected value ($3)"
+	else
+		error_is_should "$1" "$2" "$3" "$4" "$5"
+	fi
+}
+
+##############################################
+###  add vast version and nfs and mofed
+DEBUG=false
+VERBOSE=false
+EXTENDED=false
+
+while getopts hwvxg: c; do
+	case "$c" in
+	w) remediate=true ;;
+	k | g) group="keyword=${OPTARG}" ;;
+	d) DEBUG=true ;;
+	x) EXTENDED=true ;;
+	v) VERBOSE=true ;;
+	h | \?)
+		usage
+		exit 1
+		;;
+	esac
+done
+
+if [ -n "$TERM" ]; then
+	[[ "$TERM" = "xterm-color" ]] && TERM=xterm export TERM
+	if [ "$TERM" = "xterm" -o "$TERM" = "ansi" ]; then
+		bold=$(tput smso)
+		offbold=$(tput rmso)
+	fi
+fi
+
+info "${BLUE}########################################################${NORMAL}"
+info "${BLUE} Begin running: $0 at $(date) ${NORMAL}"
+info "A VAST Data client Checker tool"
+sleep 1
+
+HOSTNAME=$(uname -n)
+KERN_VERS=$(uname -r)
+
+. /etc/os-release
+#OS_NAME="`grep '^NAME=' /etc/os-release | cut -f2- | sed 's/\."\([^"]*\)"/.\1/g' `"
+#OS_VERS="`grep VERSION /etc/os-release | cut -f2-`"
+
+#PRETTY_NAME="Ubuntu 22.04.2 LTS"
+#NAME="Ubuntu"
+#VERSION_ID="22.04"
+#VERSION="22.04.2 LTS (Jammy Jellyfish)"
+
+# Check other basic OS stuff
+UPTIME=$(/usr/bin/uptime | cut -d, -f1 | tr ' ' '_')
+#IOWAIT=$(test -x /usr/sbin/iostat && (iostat 1 2 | grep -A1 iowait | tail -1  | awk '{print $4}') )
+IOWAIT=$(vmstat | grep -v system | awk '{print $(NF-1)}' | grep -A1 wa | tail -1)
+#LDAVG=$(/usr/bin/uptime |awk '{print $(NF-2)}' | tr -d ',' | bc)
+LDAVG=$(/usr/bin/uptime | awk '{print $(NF-2)}' | tr -d ',' | awk '{print $0+0}')
+#NICMODEL="`lspci |  grep Ethernet | tail -1 | cut -d: -f3 | tr ' ' '_'`"
+
+###  VAST NFS bundle driver info
+if [ -f /etc/os-release ]; then
+	. /etc/os-release
+	EL_MAJOR="${VERSION_ID%%.*}"
+fi
+
+UNAMER=$(uname -r)
+
+OFED_INFO="$(test -x /usr/bin/ofed_info && /usr/bin/ofed_info -s | tr -d ':')"
+if [ -x /usr/bin/dpkg ]; then
+	VAST_VERS="$(dpkg -l | grep vast | awk '{print $3}' | sed -e 's/^2://g' -e 's/\n/ , /g' -e 's/ , $//')"
+	dpkg -l | grep vast | grep -o DKMS >/dev/null 2>&1 && VAST_DKMS=true
+	NUM_MLNX=$(dpkg -l | grep mlnx | wc -l)
+else
+	VAST_VERS="$(rpm -qa | grep vast | tr '\n' ',' | sed -e 's/,$//')"
+	VAST_DKMS=false
+	NUM_MLNX=$(rpm -qa | grep mlnx | wc -l)
+fi
+
+CPU=$(cat /proc/cpuinfo | grep vendor_id | sort -un | awk '{print $NF}')
+MODEL_NAME=$(cat /proc/cpuinfo | grep 'model name' | sort -nu | cut -d: -f2 | sed -e 's/^ //g' -e 's/(R)//g' -e 's/ /_/g' | tr -d '@')
+
+
+info "PRETTY_NAME: $PRETTY_NAME"
+info "VERSION: $VERSION"
+[[ $EL_MAJOR = "6" ]] && fail "RHEL6 is not supported with VAST-NFS"
+info "KERN: $UNAMER"
+info "VAST: $VAST_VERS"
+info "OFED: $OFED_INFO"
+
+NVCC=$(which nvcc | grep -v found)
+if [ -n "${NVCC}" ]
+ then NCCL_VERS=$(nvcc --version)
+	 NVIDIA_VERS=$(cat /proc/driver/nvidia/version)
+      NVIDIA_SMI=$(nvidia-smi)
+      echo "you should run: /opt/common/cuda/cuda-11.8.0/gds/tools/gdscheck.py -p"
+      echo "NCCL_VERS: $NCCL_VERS"
+      echo "NVIDIA_VERS: $NVIDIA_VERS"
+      echo "........................................................."
+      echo "$NVIDIA_SMI"
+      echo "........................................................."
+fi
+
+
+BOND0=false
+test -d /proc/net/bonding/bond0 && BOND0=true
+$BOND0 && fail "linux bonding on high-speed NICS limits performance. Use Vast Multipath and no bonding for better results"
+
+info "__________________________"
+info "Checking for Mellanox NICs"
+MLNX=false
+SRIOV=false
+HOWMANY_MLX=$(lspci | grep -i mellanox | wc -l)
+HOWMANY_SRIOV=$(lspci | grep -i mellanox | grep -i virtual | wc -l)
+lspci | grep -i mellanox && MLNX=true
+lspci | grep -i mellanox | grep -i virtual >/dev/null && SRIOV=true
+
+if [ -n "$(grep -i qemu /proc/cpuinfo)" ]; then
+	IAM_KVM=true
+	echo "Iam in a KVM!"
+fi
+if [ -x /usr/bin/systemd-detect-virt ] && [ "$(/usr/bin/systemd-detect-virt)" = "kvm" ]; then
+	IAM_KVM=true
+	echo "Iam in a KVM!"
+fi
+
+$SRIOV && warn "SRIOV is enabled!"
+if [ ${HOWMANY_MLX} = ${HOWMANY_SRIOV} ]; then
+	echo "our only interface is SRIOV, and IAM_KVM=true"
+fi
+
+printf "metadata_client_mask:"
+cat /sys/module/nfs/parameters/metadata_client_mask
+#echo 255 | sudo tee /sys/module/nfs/parameters/metadata_client_mask
+
+######## Find the mellanox NICs with link up
+for i in $(ls -1 /sys/bus/pci/drivers/mlx5_core/*/net | grep -v mlx5_core | grep -v '^$' | sort -u); do
+	$DEBUG && info "Checking $i for link"
+	ethtool $i 2>&1 | grep 'Link detected: yes' >/dev/null 2>&1 && MLX_NICS="${MLX_NICS} ${i}"
+done
+
+HIGHSPEED_INTS=$(for i in $(netstat -rn | grep -Ev 'table|face' | awk '{print $NF}' | sort -u | grep -v docker | tr '\n' ' '); do ethtool $i 2>/dev/null | grep Speed | grep -v '1000Mb' >/dev/null && echo $i; done)
+NUM_HIGHSPEED=$(echo $HIGHSPEED_INTS | wc -l)
+
+if [ $NUM_HIGHSPEED -gt 1 ]; then
+	warn "More than one highspeed NIC enabled (${NUM_HIGHSPEED})"
+fi
+
+if [ $BOND0 = "true" ] && [ $NUM_HIGHSPEED -gt 1 ]; then
+	fail "linux bonding More than one NIC and using RDMA has been unstable in the past.  Use Vast Multipath for better results"
+fi
+
+###########################################
+## Loop to query the devices
+
+info "Nics with link up:"
+for i in ${MLX_NICS}; do
+	ls -ld /sys/bus/pci/drivers/mlx5_core/*/net/$i | awk '{print $NF}'
+	DEVPATH=/sys/bus/pci/drivers/mlx5_core/*/net/$i
+	#   DEBUGPATH="$(echo $DEVPATH | sed 's%/sys/bus/pci/drivers/mlx5_core%/sys/kernel/debug/mlx5/%g'-e "s%/net/${i}%%g")/cc_params/"
+
+	#[vastdata@selab-cb6-c4 ~]$ sudo ls /sys/kernel/debug/mlx5/0000:5e:00.1/cc_params
+
+	ethtool $i 2>&1 | grep 'Speed:' | sed -e 's/^[ \t]*//'
+	SPEED=$(ethtool $i 2>&1 | grep 'Speed:' | awk '{print $NF}' | sort -n | tail -1 | sed 's%/s%%g')
+
+	echo
+
+	if [ "${EXTENDED}" = "true" ] || [ "${RDMA_MOUNTS_FOUND}" = "true" ]; then
+		info "_________________________________________________________________________________"
+		info "extended flag set or RDMA mounts were found. Showing RoCE Congestion Control info"
+		info "Contact VAST support for more details about these metrics"
+
+		MLX=$(ibdev2netdev | grep $i | awk '{print $1}')
+		info "show_gids $MLX"
+		show_gids $MLX
+
+		####################
+		## Rocev2 CC params:
+		info '#########################################'
+		info 'Rocev2 CC NP (Notification point) params:'
+		set -x
+		ls /sys/class/net/${i}/ecn/roce_np
+		#ls $DEBUGPATH
+		set +x
+		info '#########################################'
+		info 'Rocev2 CC RP (Reaction point) params:'
+		set -x
+		ls /sys/class/net/${i}/ecn/roce_rp
+		set +x
+	fi
+
+done
+###################
+
+info "TCP buffer sizes and CC algo"
+sysctl -a 2>/dev/null | egrep 'wmem_max|rmem_max|tcp_rmem|tcp_wmem|mtu_probing|default_qdisc|tcp_congestion_control|ipv4.tcp_ecn|tcp_net|tcp_sack'
+
+
+# Get TCP retransmissions
+RETRANG=$(cat /proc/net/snmp | grep -A1 Segs | tail -1 | awk '{print $(NF-2)}')
+
+# Get tcp ecn value. (this is not the same as RoCEv2 ECN which is over udp and always on)
+TCP_ECN_VALUE="$(sysctl -a 2>/dev/null | grep net.ipv4.tcp_ecn | grep -v fallback | cut -d= -f2 | sed 's/^[[:space:]]*//g')"
+# For both ends of a TCP connection
+#Possible values are:
+#0 Disable ECN. Neither initiate nor accept ECN.
+#1 Enable ECN when requested by incoming connections and also request ECN on outgoing connection attempts.
+#2 Enable ECN when requested by incoming connections but do not request ECN on outgoing connections. Default: 2
+
+case $TCP_ECN_VALUE in
+0) ECN_ENABLED=false ;;
+1) ECN_ENABLED=true ;;
+2) ECN_ENABLED=incoming ;;
+esac
+
+####################
+for NIC in ${MLX_NICS}; do
+
+	# check for PFC
+	info "Checking for PFC on $NIC"
+	#test -x /usr/bin/mlnx_qos && mlnx_qos -i $NIC
+	if [ -x /usr/bin/mlnx_qos ]; then
+		if [ -n "$(mlnx_qos -i ${NIC} | grep enabled | grep -v '0   0   0   0   0   0   0   0')" ]; then
+			echo PFC enabled.
+			PFC_ENABLE=true
+		else
+			echo PFC disabled.
+			PFC_ENABLE=false
+		fi
+	fi
+
+	test -x /usr/sbin/ifconfig && IP_ADDR=$(/usr/sbin/ifconfig ${NIC} | grep 'inet ' | awk '{print $2}')
+
+	# Driver and firmware versions
+	DRIVER="$(/sbin/ethtool -i ${NIC} | grep driver | awk '{print $2}')"
+	DVERS="$(/sbin/ethtool -i ${NIC} | grep '^version' | cut -d: -f2 | sed 's/^ //g')"
+	FVERS="$(/sbin/ethtool -i ${NIC} | grep '^firmware' | cut -d: -f2 | awk '{print $1}')"
+
+	# Check if Global pause is enabled (this can be overridden if PFC is enabled)
+	GPAUSE_TX="$(/sbin/ethtool -a ${NIC} | grep '^TX' | awk '{print $NF}')"
+	GPAUSE_RX="$(/sbin/ethtool -a ${NIC} | grep '^RX' | awk '{print $NF}')"
+
+	# get qty of pause frames
+	#  Need to not hardcode here.  should read NIC
+	RX_PAUSE_PHY=$(/sbin/ethtool -S ${NIC} | grep rx_pause_ctrl_phy | awk '{print $NF}')
+	TX_PAUSE_PHY=$(/sbin/ethtool -S ${NIC} | grep tx_pause_ctrl_phy | awk '{print $NF}')
+
+	MTU=$(ip address show ${NIC} | grep mtu | sed -n -e 's/^.*mtu //p' | awk '{print $1}')
+	info "MTU=$MTU"
+	check_is_should $NIC MTU $MTU 9000 9216
+
+	echo
+	info "________________________________________________________"
+	info "Checking for pause frame counters (small numbers are OK)"
+	info "Remember:  rx pause frames are coming from the switch. "
+	info "      eg: telling host to pause because there is upstream congestion"
+	set -x
+	ethtool -S $NIC | grep pause
+	set +x
+
+	FRAME_ERRORS=$(/sbin/ifconfig -a | grep errors | grep frame | awk '{print $NF}' | sort -u | tail -1 | awk '{print $NF}')
+	if [ $FRAME_ERRORS -gt 0 ]; then
+		info "_________________________________________________"
+		info "Checking for ethernet frame errors below on $NIC:"
+		info "  (dont worry about dropped packets, they are usually from multicast)"
+		/sbin/ifconfig $NIC | grep -B8 "errors $FRAME_ERRORS"
+	fi
+
+	################################
+	sleep 1
+	RETRANG=$(($(cat /proc/net/snmp | grep -A1 Segs | tail -1 | awk '{print $(NF-2)}') - $RETRANG))
+	echo
+	info "TCP_RETRANSMITS: $RETRANG in: $SECONDS seconds"
+	check_is_should $NIC TCP_RETRANSMITS ${RETRANG} 0
+
+	################################
+	# get qty of pause frames
+	RX_PAUSE_PHY_1_SEC=$(($(ethtool -S $NIC | grep rx_pause_ctrl_phy | awk '{print $NF}') - $RX_PAUSE_PHY))
+	TX_PAUSE_PHY_1_SEC=$(($(ethtool -S $NIC | grep tx_pause_ctrl_phy | awk '{print $NF}') - $TX_PAUSE_PHY))
+
+done
+
+LDAVGINT=$(test -x /bin/bc && echo "${LDAVG}/1" | bc)
+
+#NFS testing
+
+TODAY="$(date '+%a %b %e')"
+NFSNOTRESPONDING=$(dmesg -T | grep "${TODAY}" | grep 'nfs: server' | wc -l)
+FRAME_ERRORS=$(/sbin/ifconfig -a | grep errors | grep frame: | awk '{print $NF}' | sort -u | tail -1 | cut -d: -f2)
+
+echo "NFS ERRORS from TODAY from dmesg... QTY of NFS errors: $NFSNOTRESPONDING  "
+if [ $NFSNOTRESPONDING -gt 1 ]; then
+	echo "Histogram of filers which had NFS server still trying are shown below"
+	#/bin/dmesg -T | grep "$TODAY" | grep "still trying" | cut -d\] -f2 | awk '{print $3}' | /pkg/trmb/bin/histogram -c | tee -a /tmp/not_respondingfiler.$$
+	/bin/dmesg -T | grep "$TODAY" | grep "still trying" | cut -d\] -f2 | awk '{print $3}' |
+		sort "$1" | uniq -c | sort -nr |
+		awk 'BEGIN {max=0} {if($1>max){max=$1}} {bar=""; i=s=10*$1/max; while(i-->0) bar=bar"#"; printf "%-15s %s %s\n", $2, $1, bar}' |
+		tee -a /tmp/not_respondingfiler.$$
+	DEADFILER=$(head -1 /tmp/not_respondingfiler.$$ | cut -f 1 | cut -d: -f1)
+	DEADFILER="deadfiler=$DEADFILER"
+	rm /tmp/not_respondingfiler.$$
+fi
+
+mountstats_short
+echo
+############################################################
+info "_______________"
+info "df -t nfs below"
+df -Pt nfs 2>&1 | tee -a /tmp/df_out.$$
+grep Stale /tmp/df_out.$$ && fail "Stale NFS mount found"
+
+VAST_MOUNT=$(grep ':/' /tmp/df_out.$$ | grep -i vast | tail -1 | cut -d: -f1)
+
+[[ -z "${VAST_MOUNT}" ]] && VAST_MOUNT=$(grep ':/' /tmp/df_out.$$ | tail -1 | cut -d: -f1)
+
+if [ -n $VAST_MOUNT ]; then
+	VAST_MNTPT=$(grep "${VAST_MOUNT}" /tmp/df_out.$$ | grep -i vast | tail -1 | awk '{print $1}' | cut -d: -f2)
+	info "_____________________________________________________"
+	info "Ping tests below.. full MTU-28 ($((MTU - 28))), 9000, then 1500"
+	info "   ping -c 2 -i 0.2 -M do -s $((MTU - 28)) ${VAST_MOUNT}"
+	[[ -n $VAST_MOUNT ]] && FULL_MTU_PING=$(ping -c 2 -i 0.2 -M do -s $((MTU - 28)) ${VAST_MOUNT} | grep loss)
+
+	if [ $MTU -gt 8999 ]; then
+		info "   ping -c 2 -i 0.2 -M do -s $((9000 - 28)) ${VAST_MOUNT}"
+		[[ -n $VAST_MOUNT ]] && NINE_K_MTU_PING=$(ping -c 2 -i 0.2 -M do -s $((9000 - 28)) ${VAST_MOUNT} | grep loss)
+	fi
+
+	info "   ping -c 2 -i 0.2 -M do -s $((1500 - 28)) ${VAST_MOUNT}"
+	[[ -n $VAST_MOUNT ]] && SMALL_MTU_PING=$(ping -c 2 -i 0.2 -M do -s $((1500 - 28)) ${VAST_MOUNT} | grep loss)
+
+	LATENCY="$(ping -c 5 -i 1 $VAST_MOUNT | tail -1 | cut -d= -f2 | cut -d/ -f2)"
+fi
+
+info "ping LATENCY to ${VAST_MOUNT}:${VAST_MNTPT}   ${LATENCY}ms"
+
+rm -f /tmp/df_out.$$
+
+echo
+if [ -n "$(echo $FULL_MTU_PING | grep '100% packet loss')" ]; then
+	fail "MTU: ${MTU} $FULL_MTU_PING"
+else
+	pass "MTU: ${MTU} $FULL_MTU_PING"
+fi
+
+if [ -n "$(echo $NINE_K_MTU_PING | grep '100% packet loss')" ]; then
+	fail "MTU: 9000 $NINE_K_MTU_PING"
+else
+	pass "MTU: 9000 $NINE_K_MTU_PING"
+fi
+# This one better work...
+if [ -n "$(echo $NINE_K_MTU_PING | grep '100% packet loss')" ]; then
+	fail "MTU: 1500 $SMALL_MTU_PING"
+else
+	pass "MTU: 1500 $SMALL_MTU_PING"
+fi
+
+############################################################
+info "____________________________"
+info "Checking for DNS Round Robin"
+if [ -n "${VAST_MOUNT}" ]; then
+	DNSRR1=$(getent hosts $VAST_MOUNT | awk '{print $1}')
+	sleep 1
+	DNSRR2=$(getent hosts $VAST_MOUNT | awk '{print $1}')
+
+	if [ "${DNSRR1}" = "${DNSRR2}" ]; then
+		fail "Looks like you are mounting by IP, or not using DNS Round Robin."
+		fail "contact support if you need help."
+	else
+		pass "Looks like you are using DNS Round Robin. or VAST DNS. thats cool."
+	fi
+else
+	warn "No NFS mounts found.. can't check DNS-rr"
+fi
+
+############################################################
+if [ -x "$(which lldptool)" ] && [ "${HAVE_SUDO}" = "true" ] && [ -n "$(pgrep lldpad)" ]; then
+	info "____________________________________________________________________"
+	info "lldp daemon running and you have sudo ... getting upstream port info"
+	PORTS=${MLX_NICS} # These are the mellanox ports with link up
+	set +x
+	for PORT in $PORTS; do
+		$DEBUG && echo "RUNNING lldp checks on $PORT"
+
+		TMPF=/tmp/$PORT
+		$DEBUG && echo "lldptool get-tlv    -i $PORT "
+		$DEBUG && echo "lldptool get-tlv -n -i $PORT "
+		$HAVE_SUDO && sudo lldptool get-tlv -i $PORT >${TMPF}_local
+		$HAVE_SUDO && sudo lldptool get-tlv -n -i $PORT >${TMPF}_neighbor
+		PORTDESC=$(grep -A1 'Port Description TLV' ${TMPF}_local | tail -1 | awk '{print $NF}')
+
+		SWITCHPORT=$(grep -A1 'Port ID TLV' ${TMPF}_neighbor | tail -1 | awk '{print $NF}')
+		SWITCHNAME=$(grep -A1 'System Name TLV' ${TMPF}_neighbor | tail -1 | awk '{print $NF}')
+		SWITCHIP=$(grep -A1 'Management Address TLV' ${TMPF}_neighbor | tail -1 | awk '{print $NF}')
+		SWITCHDESC=$(grep -A1 'System Description TLV' ${TMPF}_neighbor | tail -1 | awk '{print $NF}')
+
+		info "local_DESC $PORTDESC"
+		info "SWITCHPORT $SWITCHPORT"
+		info "SWITCHNAME $SWITCHNAME"
+		info "SWITCHIP   $SWITCHIP"
+	done
+
+	rm -f ${TMPF}_local ${TMPF}_neighbor
+else
+	warn "If you have sudo access, lldptool installed, and lldpad enabled, you will get switch details."
+fi
+
+############################################################
+info "_____________________________________________"
+info "Checking Changelog for latest VAST-NFS driver"
+info "    wget -P /tmp  https://vastnfs.vastdata.com/docs/4.0/ChangeLog.html"
+wget -P /tmp https://vastnfs.vastdata.com/docs/4.0/ChangeLog.html >/dev/null 2>&1
+LATEST_VAST_NFS=$(grep 'href="#4' /tmp/ChangeLog.html | head -1 | sed 's/.*>\(.*\)<\/a>.*/\1/')
+
+VAST_SHORT=$(echo $VAST_VERS | sed 's/.*vastnfs-\(.*\)-MLNX_.*/\1/')
+#vastpreload-1.0.3-1.x86_64,vastnfs-4.0.16-MLNX_OFED_LINUX.5.8.1.1.2.1_kernel_4.18.0_348.7.1.el8_5.x86_64
+
+if [ "$LATEST_VAST_NFS" = "$VAST_SHORT" ]; then
+	pass "You have the latest vast-nfs version $VAST_SHORT"
+else
+	fail "You are NOT running the latest VAST-NFS version: $LATEST_VAST_NFS != $VAST_SHORT"
+fi
+
+# We should probably check for the latest then warn or pass
+VAST_PRELOAD=$(echo $VAST_VERS | sed 's/vastpreload-\(.*\).x86_64,.*/\1/')
+[[ -n "$VAST_PRELOAD" ]] && warn "vast-preload version: $VAST_PRELOAD"
+
+info "_________________________________________________"
+info "Checking NFS readahead for the most recent mounts"
+rm -f /tmp/readahead_out.$$
+touch /tmp/readahead_out.$$
+for i in $(df -Pt nfs 2>/dev/null | grep -v 'Filesystem' | awk '{print $NF}'); do
+	cat /sys/class/bdi/0:$(stat -c '%d' "$i")/read_ahead_kb | sort -un >>/tmp/readahead_out.$$
+done
+HOWMANY_UNIQ_RA=$(wc -l /tmp/readahead_out.$$ | awk '{print $1}')
+BIGGEST_RA=$(tail -1 /tmp/readahead_out.$$)
+info "    $HOWMANY_UNIQ_RA NFS mounts found.  Showing largest readahead value:"
+rm -f /tmp/readahead_out.$$
+check_is_should $i Nfs_Readahead_KB $BIGGEST_RA 4096
+
+## nfsiostat does not work on sles10sp4 and below..
+echo "NFSIOSTAT output below.. active NFS in the last 5 seconds.. should have a bunch of lines... "
+echo "if there are NONE and LDAVG: $LDAVG is high, then there is likely a stuck network on $HOSTNAME"
+## this is currently broken.. will fix later.
+if [ -n "$(nfsiostat --version | grep -v 'version 0.2')" ]; then
+	echo "cant find a the right nfsiostat...not checking"
+	NUMMOUNTSHEAD="not able to test nfsiostat"
+else
+	NUMMOUNTSHEAD=$(nfsiostat 5 1 | grep -v filesystem | grep -v ' 0.00$' | wc -l)
+
+	set -x
+	echo NUMMOUNTSHEAD is wrong
+	nfsiostat 5 2 | grep -v ' 0.00$' | grep -v Filesystem | tail +${NUMMOUNTSHEAD} | tee -a /tmp/nfsiostat.out
+	set +x
+
+	BUSY=$(egrep -v '^$|Filesystem|Linux' /tmp/nfsiostat.out | sort -n +2 | tail -1)
+	if [ "x$BUSY" = "x" ]; then
+		BUSY="${onbold}NONE${offbold}"
+	fi
+	rm -f /tmp/nfsiostat.out
+
+	#if it is a number, then run host on it because it could be a CNAME.
+	case $BUSYFILER in
+	[0-9]) BUSY=$(host $BUSY | awk '{print $1}' | tail -1 | cut -d\. -f1) ;;
+	*) BUSY=$BUSY ;;
+	esac
+	[[ -n "$BUSY" ]] && BUSYFILER="busyfiler=$BUSY"
+fi
+
+FILERIO=$(echo $BUSY | awk '{print $1,$2}')
+
+####################
+#172.200.201.1:/scratch1 on /mnt/scratch1 type nfs (rw,relatime,vers=3,rsize=1048576,wsize=1048576,namlen=255,hard,forcerdirplus,proto=rdma,nconnect=8,port=20049,timeo=600,retrans=2,sec=sys,mountaddr=172.200.201.1,mountvers=3,mountproto=tcp,local_lock=none,addr=172.200.201.1)
+RSIZE=$(mount | grep $VAST_MOUNT | sed 's/.*rsize=\(.*\),wsize.*/\1/')
+WSIZE=$(mount | grep $VAST_MOUNT | sed 's/.*wsize=\(.*\),namlen.*/\1/')
+NCONNECT=$(mount | grep $VAST_MOUNT | grep nconnect | sed 's/.*nconnect=\(.*\),port.*/\1/')
+#XXX need to be smarter.. if nconnect=nil, then check again for another.
+
+check_is_should NFS_mount RSIZE $RSIZE 1048576
+check_is_should NFS_mount WSIZE $WSIZE 1048576
+
+### check/set some pROBlem flags
+[[ $RETRANG -gt 100 ]] && PROBLEM="retrans_high;$PROBLEM"
+[[ $LDAVGINT -gt 18 ]] && PROBLEM="loadavg_high;$PROBLEM"
+[[ $IOWAITINT -gt 3 ]] && PROBLEM="iowait_high;$PROBLEM"
+[[ $AFSERRORS -gt 3 ]] && PROBLEM="afs_errors;$PROBLEM"
+[[ $NFSERRORS -gt 3 ]] && PROBLEM="nfs_errors;$PROBLEM"
+#[[ "$DVERS" = "10.2.261.0" ]] && PROBLEM="known_bad_driver,$PROBLEM"
+
+#[[ -n "$PROBLEM" ]] && PROBLEM="PROBLEM=$PROBLEM"
+if [ "x" = "x$PROBLEM" ]; then PROBLEM=noproblem; fi
+
+####################
+if [ -n "$(mount | grep 'proto=rdma')" ] && [ "$PFC_ENABLE" = "false" ]; then
+	fail "RDMA mounts found, and PFC is not enabled. please contact support"
+fi
+
+info "Summary below going to syslog"
+set -x
+logger -t ck_vastclient "problem=${PROBLEM} ${group} cpu_sku=$CPU model_name=${MODEL_NAME} int=${NIC} speed=${SPEED} pretty_name=$(echo $PRETTY_NAME | tr ' ' '_') ip_addr=${IP_ADDR} mtu=$MTU uptime=$UPTIME  driver=$DRIVER mellanox=$MLNX sriov=$SRIOV driver_version=$DVERS firmware_version=$FVERS FRAME_ERRORS=$FRAME_ERRORS ldavg=$LDAVG iowait=${IOWAIT}  ping_latency=$LATENCY nfs_errors=$NFSNOTRESPONDING $BUSYFILER $DEADFILER tcp_retransmits=$RETRANG seconds=$SECONDS GPAUSE_TX=$GPAUSE_TX GPAUSE_RX=$GPAUSE_RX RX_PAUSE_PHY_1_SEC=$RX_PAUSE_PHY_1_SEC TX_PAUSE_PHY_1_SEC=$TX_PAUSE_PHY_1_SEC ECN_ENABLED=$ECN_ENABLED TCP_ECN_VALUE=$TCP_ECN_VALUE PFC_ENABLE=$PFC_ENABLE KERN_VERS=$KERN_VERS OFED_INFO=$OFED_INFO VAST_VERS=$VAST_VERS VAST_DKMS=$VAST_DKMS nconnect=${NCONNECT}"
+set +x
+
+# Send a grafana annotation
+#curl -XPOST http://opsmon.sli.vastdata.com:9200/events/prod/ -d "{
+#    \"when_it_happened\": \"2015-04-27T18:30:14.000Z\", \"title\" : \"ck_net\", \"description\" : \"$HOSTNAME ran ck_net and found $PROBLEMS\"
+# }
+# "
+
+# Send to Logstash/Elasticsearch
+#echo "Sending to Logstash/Elasticsearch"
+#set -x
+#echo "timestamp=$EPOCHT problem=${PROBLEM} ${group} hw_model=${HWMODEL} cpu_sku=${MODEL} nicmodel=$NICMODEL uptime=$UPTIME int=${PRIMARYINT} driver_version=$DVERS firmware_version=$FVERS driver=$DRIVERN num_hppkg=$NUMHPPKGS hp_kern_rpm=$HPKERNRPM CLUSTER=$CLUSTER OS_DIST=$OS_DIST FRAME_ERRORS=$FRAME_ERRORS ldavg=$LDAVG iowait=${IOWAIT} afs_errors=$AFSERRORS nfs_errors=$NFSNOTRESPONDING busyfiler=$BUSYFILER deadfiler=$DEADFILER tcp_retransmits=$RETRANG seconds=$SECONDS" | /usr/bin/nc -w1 10.52.140.86 5000
+#
+#set +x
+echo "##############___________${bold}${PROBLEM}${offbold}_____________________________________________________________________________###########"
